@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "acme.lock",
+  "name": "My Lock Screen",
+  "version": "1.0.0",
+  "author": "acme",
+  "description": "Lock screen clone",
+  "omarchy": {
+    "clonedFrom": "omarchy.lock"
+  },
+  "kinds": [
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
