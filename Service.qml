@@ -87,6 +87,19 @@ Item {
     }
   }
 
+  // Mimics the genuine lock's stabilize delay: engaging the session lock
+  // synchronously inside the IPC call races the surface creation (Quickshell
+  // 6.11.2 aborts with "Tried to show lockscreen surfaces without active
+  // lock" when the state is polluted). The genuine lock queues the request
+  // and engages after a timer — so does the replica.
+  Timer {
+    id: engageTimer
+    interval: 300
+    onTriggered: {
+      if (root.lockRequested) sessionLock.locked = true
+    }
+  }
+
   WlSessionLock {
     id: sessionLock
 
@@ -143,7 +156,7 @@ Item {
     function lock(): string {
       root.resetAll()
       root.lockRequested = true
-      sessionLock.locked = true
+      engageTimer.restart()
       return "ok"
     }
 
